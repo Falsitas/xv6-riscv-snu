@@ -55,8 +55,6 @@ sys_sleep(void)
   uint ticks0;
 
   argint(0, &n);
-  if(n < 0)
-    n = 0;
   acquire(&tickslock);
   ticks0 = ticks;
   while(ticks - ticks0 < n){
@@ -91,3 +89,46 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+#ifdef SNU
+/* Do not touch sys_time() */
+uint64 
+sys_time(void)
+{
+  uint64 x;
+
+  asm volatile("rdtime %0" : "=r" (x));
+  return x;
+}
+/* Do not touch sys_time() */
+
+uint64
+sys_sched_setattr(void)
+{
+  // FILL HERE
+  // call sched_setattr with given arguments
+  int pid, runtime, period;
+  argint(0, &pid);
+  argint(1, &runtime);
+  argint(2, &period);
+  // printf("called sched_setattr(%d, %d, %d)\n", pid, runtime, period);
+  return sched_setattr(pid, runtime, period);
+}
+
+uint64
+sys_sched_yield(void)
+{
+  struct proc *p = myproc();
+  // for normal processes, just call yield()
+  acquire(&p->lock);
+  if(p->runtime == 0 && p->period == 0) {
+    release(&p->lock);
+    yield();
+  }
+  else {
+    release(&p->lock);
+    sched_yield();
+  }
+  return 0;
+}
+#endif

@@ -20,6 +20,9 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
+extern uint ticks;
+uint64 is_RT;
+
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
 // memory model when using p->parent.
@@ -48,6 +51,7 @@ void
 procinit(void)
 {
   struct proc *p;
+  int index = 0;
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
@@ -55,6 +59,8 @@ procinit(void)
       initlock(&p->lock, "proc");
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
+      p->index = index;
+      index++;
   }
 }
 
@@ -169,6 +175,9 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->runtime = 0;
+  p->period = 0;
+  p->set_time = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -347,6 +356,7 @@ void
 exit(int status)
 {
   struct proc *p = myproc();
+  uint64 mask = 1;
 
   if(p == initproc)
     panic("init exiting");
@@ -377,6 +387,7 @@ exit(int status)
 
   p->xstate = status;
   p->state = ZOMBIE;
+  is_RT &= ~(mask << (p->index));
 
   release(&wait_lock);
 
@@ -434,6 +445,20 @@ wait(uint64 addr)
   }
 }
 
+// for debugging
+void print_info(struct proc *p, char* m, int i) {
+  printf("From %s at %d. index: %d pid: %d, runtime: %d, period:%d, state:%d\n", m, i, p->index, p->pid, p->runtime, p->period, p->state);
+}
+
+void print_is_RT() {
+  uint64 mask = 1;
+  for(int i = 0; i < 64; i++) {
+    printf("%d", (is_RT & (mask << i)) >> i);
+  }
+  printf("\n");
+}
+// for debugging
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -445,22 +470,104 @@ void
 scheduler(void)
 {
   struct proc *p;
+  struct proc *rt;
+  struct proc *next_rt;
   struct cpu *c = mycpu();
-
+  int closest;
+  int min_pid;
+  int current_running = -1;
+  int remaining;
+  int tie_flag;
+  uint64 mask;
+  
   c->proc = 0;
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting.
+    // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
-    int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
+      // First, check if there is any realtime process set
+      next_rt = 0;
+      mask = 1;
+      closest = 2147483647;
+      min_pid = 2147483647;
+      tie_flag = 0;
+      // if(is_RT != 0)
+      //   print_is_RT();
+      for(int i = 0; i < 64; i++) {
+        if((is_RT & mask) != 0) {  // if it is a realtime process
+          rt = &proc[i];
+          acquire(&rt->lock);
+          // print_info(rt, "selecting", i);
+          // calculate remaining to the period
+          remaining = rt->period - (ticks - rt->set_time);
+          // set state as RUNNABLE if new period come
+          if(remaining <= 0) {
+            rt->state = RUNNABLE;
+            rt->set_time = ticks;
+            remaining = rt->period - (ticks - rt->set_time);
+          }
+          // skip for done process for this period
+          if(rt->state == DONE_THIS_PERIOD) {
+            mask <<= 1;
+            release(&rt->lock);
+            continue;
+          }
+          // select closest realtime process to run
+          if(remaining == closest) {
+            // tie breaking rule
+            if(rt->index == current_running) {
+              next_rt = rt;
+              tie_flag = 1;
+            }
+            else if(tie_flag == 0) {
+              if(rt->pid < min_pid) {
+                next_rt = rt;
+                min_pid = rt->pid;
+              }
+            }
+          }
+          else if(remaining < closest) {
+            closest = remaining;
+            next_rt = rt;
+            tie_flag = 0;
+            min_pid = rt->pid;
+          }
+          release(&rt->lock);
+        }
+        mask <<= 1;
+      }
+      
+      // if there was any realtime process, schedule it
+      if(next_rt != 0) {
+        acquire(&next_rt->lock);
+        // print_info(next_rt, "SCHEDULING-R", -1);
+        // switch to chosen realtime process
+        next_rt->state = RUNNING;
+        current_running = next_rt->index;
+        c->proc = next_rt;
+        swtch(&c->context, &next_rt->context);
+
+        // realtime process done running
+        c->proc = 0;
+        release(&next_rt->lock);
+        // move proc ptr p backward one index
+        // not to violate round robin policy for normal process
+        p--;
+        // go back to the first part of the loop
+        // to check if there is another realtime process
+        continue;
+      }
+
+      // scheduling for normal process
+      mask = 1;
+      current_running = -1;
       acquire(&p->lock);
-      if(p->state == RUNNABLE) {
+      if((p->state == RUNNABLE) && ((is_RT & (mask << (p->index))) == 0)) {
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
+        // print_info(p, "SCHEDULING-N", -1);
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
@@ -468,14 +575,8 @@ scheduler(void)
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
-        found = 1;
       }
       release(&p->lock);
-    }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      intr_on();
-      asm volatile("wfi");
     }
   }
 }
@@ -512,6 +613,7 @@ void
 yield(void)
 {
   struct proc *p = myproc();
+  // printf("YIELD ticks: %d, pid: %d\n", ticks, p->pid);
   acquire(&p->lock);
   p->state = RUNNABLE;
   sched();
@@ -532,11 +634,8 @@ forkret(void)
     // File system initialization must be run in the context of a
     // regular process (e.g., because it calls sleep), and thus cannot
     // be run from main().
-    fsinit(ROOTDEV);
-
     first = 0;
-    // ensure other cores see first=0.
-    __sync_synchronize();
+    fsinit(ROOTDEV);
   }
 
   usertrapret();
@@ -561,6 +660,7 @@ sleep(void *chan, struct spinlock *lk)
 
   // Go to sleep.
   p->chan = chan;
+  p->prestate = p->state;
   p->state = SLEEPING;
 
   sched();
@@ -584,7 +684,12 @@ wakeup(void *chan)
     if(p != myproc()){
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
-        p->state = RUNNABLE;
+        if(p->prestate == DONE_THIS_PERIOD) {
+          p->state = DONE_THIS_PERIOD;
+        }
+        else {
+          p->state = RUNNABLE;
+        }
       }
       release(&p->lock);
     }
@@ -692,4 +797,67 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+// code added here!
+int sched_setattr(int pid, int runtime, int period) {
+  // printf("SCHED_SETATTR pid: %d, runtime: %d, period: %d\n", pid, runtime, period);
+  if(pid < 0) {
+    // printf("sched_setattr: negative pid\n");
+    return -1;
+  } else if(runtime <= 0 || period <= 0) {
+    // printf("sched_setattr: negative time argument\n");
+    return -1;
+  } else if(runtime >= period) {
+    // except normal processes
+    // printf("sched_setattr: longer runtime than period\n");
+    return -1;
+  }
+
+  struct proc *p;
+  uint64 mask = 1;
+  // find process that matches pid
+  // if pid is 0, set arguments to calling process
+  if(pid == 0) {
+    p = myproc();
+  }
+  else {
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->pid == pid) {
+        if(p->state == UNUSED) {
+          // printf("process %d does not exist\n", pid);
+          release(&p->lock);
+          return -1;
+        }
+        release(&p->lock);
+        break;
+      }
+      release(&p->lock);
+    }
+  }
+
+  acquire(&p->lock);
+  p->runtime = runtime;
+  p->period = period;
+  p->set_time = ticks;
+  is_RT |= (mask << (p->index));
+  release(&p->lock);
+
+  // if successful, return 0
+  // if not, return -1
+
+  return 0;
+}
+
+void sched_yield() {
+  // called sched_yield() means calling realtime process
+  // have done its task for this period
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  // change state to DONE_THIS_PERIOD
+  p->state = DONE_THIS_PERIOD;
+  // printf("SCHED_YIELD ticks: %d, pid: %d, period: %d, set_time: %d\n", ticks, p->pid, p-> period, p->set_time);
+  sched();
+  release(&p->lock);
 }
